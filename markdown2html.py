@@ -1,221 +1,171 @@
-""" Notice how this file is completely independent of sublime text
+#!/usr/bin/env python3
 
-I think it should be kept this way, just because it gives a bit more organisation,
-and makes it a lot easier to think about, and for anyone who would want to, test since
-markdown2html is just a pure function
+# Copyright 2016 Panagiotis Ktistakis <panktist@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
+Usage: markdown2html [options] <file>
+
+Convert a GitHub Flavored Markdown file to HTML, using
+markdown, pygments and the latest github-markdown.css from
+https://github.com/sindresorhus/github-markdown-css
+
+Options:
+  -o, --out <file>      Write output to <file>
+  -f, --force           Overwrite existing CSS file
+  -p, --preview         Open generated HTML file in browser
+  -i, --interval <int>  Refresh page every <int> seconds
+  -q, --quiet           Show less information
+  -h, --help            Show this help message and exit
 """
 
-import io
-import struct
+import logging
 import os.path
-import concurrent.futures
+import sys
 import urllib.request
-import base64
-import bs4
+import webbrowser
 
-from functools import partial
+import markdown
 
-from .lib.markdown2 import Markdown
+TEMPLATE = """\
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    %s
+    <title>%s</title>
+    <link rel="stylesheet" href="%s">
+    <style>
+      .markdown-body {
+        border: 1px solid #ddd;
+        border-radius: 3px;
+        max-width: 888px;
+        margin: 64px auto 51px;
+        padding: 45px;
+      }
+    </style>
+  </head>
+  <body>
+    <article class="markdown-body">
+      %s
+    </article>
+  </body>
+</html>
+"""
 
-__all__ = ("markdown2html",)
 
-markdowner = Markdown(extras=["fenced-code-blocks", "cuddled-lists"])
+def download_css(path):
+    """Get latest github-markdown.css and store it at `path`."""
+    url = ('https://raw.githubusercontent.com/sindresorhus/'
+           'github-markdown-css/gh-pages/github-markdown.css')
+    try:
+        with urllib.request.urlopen(url) as r, open(path, 'wb') as f:
+            f.write(r.read())
+    except urllib.error.URLError:
+        logging.warning("Unable to download CSS file")
 
-# FIXME: how do I choose how many workers I want? Does thread pool reuse threads or
-#        does it stupidly throw them out? (we could implement something of our own)
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
-def markdown2html(markdown, basepath, re_render, resources, viewport_width):
-    """ converts the markdown to html, loads the images and puts in base64 for sublime
-    to understand them correctly. That means that we are responsible for loading the
-    images from the internet. Hence, we take in re_render, which is just a function we 
-    call when an image has finished loading to retrigger a render (see #90)
+def render(text, title, csspath, interval):
+    """Convert a Markdown string to an HTML page.
+
+    The following Markdown extensions are used to support most GFM features:
+    codehilite, fenced_code, sane_lists, tables.
     """
-    html = markdowner.convert(markdown)
+    extensions = [
+        'markdown.extensions.codehilite',
+        'markdown.extensions.fenced_code',
+        'markdown.extensions.sane_lists',
+        'markdown.extensions.tables',
+    ]
 
-    soup = bs4.BeautifulSoup(html, "html.parser")
-    for img_element in soup.find_all("img"):
-        src = img_element["src"]
-
-        # already in base64, or something of the like
-        # FIXME: what other types are possible? Are they handled by ST? If not, could we
-        #        convert it into base64? is it worth the effort?
-        if src.startswith("data:image/"):
-            continue
-
-        if src.startswith("http://") or src.startswith("https://"):
-            path = src
-        elif src.startswith("file://"):
-            path = src[len("file://") :]
-        else:
-            # expanduser: ~ -> /home/math2001
-            # realpath: simplify that paths so that we don't have duplicated caches
-            path = os.path.realpath(os.path.expanduser(os.path.join(basepath, src)))
-
-        base64, (width, height) = get_base64_image(path, re_render, resources)
-
-        img_element["src"] = base64
-        if width > viewport_width:
-            img_element["width"] = viewport_width
-            img_element["height"] = viewport_width * (height / width)
-
-    # remove comments, because they pollute the console with error messages
-    for comment_element in soup.find_all(
-        text=lambda text: isinstance(text, bs4.Comment)
-    ):
-        comment_element.extract()
-
-    # FIXME: how do tables look? should we use ascii tables?
-
-    # pre aren't handled by ST3. The require manual adjustment
-    for pre_element in soup.find_all("pre"):
-        # select the first child, <code>
-        code_element = next(pre_element.children)
-
-        # FIXME: this method sucks, but can we do better?
-        fixed_pre = (
-            str(code_element)
-            .replace(" ", '<i class="space">.</i>')
-            .replace("\n", "<br />")
-        )
-
-        code_element.replace_with(bs4.BeautifulSoup(fixed_pre, "html.parser"))
-
-    # FIXME: highlight the code using Sublime's syntax
-
-    # FIXME: report that ST doesn't support <br/> but does work with <br />... WTF?
-    return "<style>\n{}\n</style>\n\n{}".format(resources["stylesheet"], soup).replace(
-        "<br/>", "<br />"
-    )
-
-images_cache = {}
-images_loading = []
-
-def get_base64_image(path, re_render, resources):
-    """ Gets the base64 for the image (local and remote images). re_render is a
-    callback which is called when we finish loading an image from the internet
-    to trigger an update of the preview (the image will then be loaded from the cache)
-
-    return base64_data, (width, height)
-    """
-
-    def callback(path, resources, future):
-        # altering images_cache is "safe" to do because callback is called in the same
-        # thread as add_done_callback:
-        # > Added callables are called in the order that they were added and are always
-        # > called in a thread belonging to the process that added them
-        # > --- Python docs
-        try:
-            images_cache[path] = future.result()
-        except urllib.error.HTTPError as e:
-            images_cache[path] = resources['base64_404_image']
-            print("Error loading {!r}: {!r}".format(path, e))
-
-        images_loading.remove(path)
-
-        # we render, which means this function will be called again, but this time, we
-        # will read from the cache
-        re_render()
-
-    if path in images_cache:
-        return images_cache[path]
-
-    if path.startswith("http://") or path.startswith("https://"):
-        # FIXME: submiting a load of loaders, we should only have one
-        if path not in images_loading:
-            executor.submit(load_image, path).add_done_callback(partial(callback, path, resources))
-            images_loading.append(path)
-        return resources['base64_loading_image']
-
-    with open(path, "rb") as fhandle:
-        image_content = fhandle.read()
-        width, height = get_image_size(io.BytesIO(image_content), path)
-
-        image = "data:image/png;base64," + base64.b64encode(image_content).decode(
-            "utf-8"
-        )
-        images_cache[path] = image, (width, height)
-        return images_cache[path]
-
-
-def load_image(url):
-    with urllib.request.urlopen(url, timeout=60) as conn:
-
-        image_content = conn.read()
-        width, height = get_image_size(io.BytesIO(image_content), url)
-
-        content_type = conn.info().get_content_type()
-        if "image" not in content_type:
-            raise ValueError(
-                "{!r} doesn't point to an image, but to a {!r}".format(
-                    url, content_type
-                )
-            )
-        return (
-            "data:image/png;base64," + base64.b64encode(image_content).decode("utf-8"),
-            (width, height),
-        )
-
-
-def get_image_size(fhandle, pathlike):
-    """ Thanks to https://stackoverflow.com/a/20380514/6164984 for providing the basis
-        of a working solution.
-
-    fhandle should be a seekable stream. It's not the best for non-seekable streams,
-    but in our case, we have to load the whole stream into memory anyway because base64
-    library only accepts bytes-like objects, and not streams.
-
-    pathlike is the filename/path/url of the image so that we can guess the file format
-    """
-
-    format_ = os.path.splitext(os.path.basename(pathlike))[1][1:]
-
-    head = fhandle.read(24)
-    if len(head) != 24:
-        return "invalid head"
-    if format_ == "png":
-        check = struct.unpack(">i", head[4:8])[0]
-        if check != 0x0D0A1A0A:
-            return
-        width, height = struct.unpack(">ii", head[16:24])
-    elif format_ == "gif":
-        width, height = struct.unpack("<HH", head[6:10])
-    elif format_ == "jpeg":
-        try:
-            fhandle.seek(0)  # Read 0xff next
-
-            size = 2
-            ftype = 0
-            while not 0xC0 <= ftype <= 0xCF:
-                fhandle.seek(size, 1)
-                byte = fhandle.read(1)
-                if byte == b"":
-                    fhandle = end
-                    byte = fhandle.read(1)
-
-                while ord(byte) == 0xFF:
-                    byte = fhandle.read(1)
-                ftype = ord(byte)
-                size = struct.unpack(">H", fhandle.read(2))[0] - 2
-            # We are at a SOFn block
-            fhandle.seek(1, 1)  # Skip `precision' byte.
-            height, width = struct.unpack(">HH", fhandle.read(4))
-        except Exception as e:  # IGNORE:W0703
-            raise e
-    else:
-        return "unknown format {!r}".format(format_)
-    return width, height
-
-
-def independent_markdown2html(markdown):
-    return markdown2html(
-        markdown,
-        ".",
-        lambda: None,
-        {
-            "base64_404_image": ("", (0, 0)),
-            "base64_loading_image": ("", (0, 0)),
-            "stylesheet": "",
+    configs = {
+        'markdown.extensions.codehilite': {
+            'noclasses': True,
+            'pygments_style': 'tango',
         },
-        960,
+        'pymdownx.highlight': {
+            'guess_lang': False,
+            'noclasses': True,
+            'pygments_style': 'tango',
+        },
+    }
+
+    try:
+        import pymdownx  # noqa
+    except ImportError:
+        logging.info("Module pymdownx not found")
+    else:
+        extensions.remove('markdown.extensions.fenced_code')
+        extensions.append('pymdownx.extra')
+        extensions.append('pymdownx.magiclink')
+        extensions.append('pymdownx.tasklist')
+        extensions.append('pymdownx.highlight')
+        extensions.append('pymdownx.tilde')
+
+    body = markdown.markdown(text, extensions=extensions,
+                             extension_configs=configs)
+    refresh = '<meta http-equiv="refresh" content="%s">' % interval
+    refresh = refresh if interval is not None else ''
+    html = TEMPLATE % (refresh, title, csspath, body)
+    return html
+
+
+def run(mdpath, out=None, force=False, preview=False, interval=None):
+    """Generate an HTML file from a Markdown one."""
+    if not os.path.isfile(mdpath):
+        logging.error("No such file: %s", mdpath)
+        sys.exit(1)
+    mdfilename = os.path.basename(mdpath)
+    htmlpath = out or '/tmp/%s.html' % os.path.splitext(mdfilename)[0]
+    csspath = os.path.expanduser('~/.cache/github-markdown.css')
+
+    if force or not os.path.isfile(csspath):
+        logging.info("Downloading github-markdown.css...")
+        download_css(csspath)
+
+    logging.info("Converting %s to HTML...", mdfilename)
+    with open(mdpath) as f:
+        text = f.read()
+    html = render(text, title=mdfilename, csspath=csspath, interval=interval)
+    with open(htmlpath, 'w') as f:
+        f.write(html)
+
+    if preview:
+        browser = webbrowser.get().name
+        logging.info("Opening %s in %s...", htmlpath, browser)
+        webbrowser.open(htmlpath)
+
+
+def main():
+    """Parse arguments and run."""
+    from docopt import docopt
+
+    args = docopt(__doc__)
+
+    logging.basicConfig(format='%(message)s')
+    level = logging.WARNING if args['--quiet'] else logging.INFO
+    logging.root.setLevel(level)
+
+    run(
+        args['<file>'],
+        args['--out'],
+        args['--force'],
+        args['--preview'],
+        args['--interval'],
     )
+
+
+if __name__ == '__main__':
+    main()
